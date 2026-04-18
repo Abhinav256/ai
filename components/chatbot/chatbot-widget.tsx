@@ -40,8 +40,11 @@ export function ChatbotWidget() {
   const [recording, setRecording] = useState(false)
   const [speechSupported, setSpeechSupported] = useState(true)
   const [speechLanguage, setSpeechLanguage] = useState<'en-IN' | 'en-US'>('en-IN')
+  const [isListening, setIsListening] = useState(false)
+  const [isClosing, setIsClosing] = useState(false)
   const recognitionRef = useRef<any>(null)
   const inputRef = useRef<HTMLInputElement | null>(null)
+  const silenceTimeoutRef = useRef<any>(null)
   const { pendingAnomaly, setPendingAnomaly, onAnomalyResolved } = useChatbot()
   const pathname = usePathname()
 
@@ -71,6 +74,35 @@ export function ChatbotWidget() {
     if (!text) return text
     return text.charAt(0).toUpperCase() + text.slice(1)
   }
+
+  // Stop listening with a closing animation
+  const stopListeningWithAnimation = () => {
+    clearTimeout(silenceTimeoutRef.current)
+    if (recognitionRef.current) {
+      try {
+        recognitionRef.current.abort()
+      } catch (e) {
+        // Ignore cleanup errors
+      }
+    }
+    setIsClosing(true)
+    // Wait for the pop-out animation to finish before hiding
+    setTimeout(() => {
+      setIsListening(false)
+      setIsClosing(false)
+      setRecording(false)
+    }, 450)
+  }
+
+  // Handle auto-send when listening ends
+  useEffect(() => {
+    if (!isListening && input.trim() && !recording) {
+      const timer = setTimeout(() => {
+        handleVoiceSubmit()
+      }, 150)
+      return () => clearTimeout(timer)
+    }
+  }, [isListening])
 
   // Get user role and session from localStorage on mount
   useEffect(() => {
@@ -114,11 +146,28 @@ export function ChatbotWidget() {
     recognition.continuous = false
 
     recognition.onstart = () => {
+      console.log("[CHATBOT] Voice dictation started")
       setRecording(true)
+      setIsListening(true)
+      setIsClosing(false)
       inputRef.current?.focus()
+      
+      // Start 5-second initial silence timeout
+      clearTimeout(silenceTimeoutRef.current)
+      silenceTimeoutRef.current = setTimeout(() => {
+        console.log("[CHATBOT] No speech detected for 5s, auto-stopping")
+        stopListeningWithAnimation()
+      }, 5000)
     }
 
     recognition.onresult = (event: any) => {
+      // Reset silence timeout on any speech activity
+      clearTimeout(silenceTimeoutRef.current)
+      silenceTimeoutRef.current = setTimeout(() => {
+        console.log("[CHATBOT] Silence detected for 2s after speech, auto-stopping")
+        stopListeningWithAnimation()
+      }, 2000)
+
       // Use only the latest result to prevent duplication
       const resultIndex = event.resultIndex
       const result = event.results[resultIndex]
@@ -133,7 +182,7 @@ export function ChatbotWidget() {
           const cleanedTranscript = cleanDuplicatePhrases(transcript)
           const capitalizedTranscript = capitalizeFirstLetter(cleanedTranscript)
           
-          setInput((current) => {
+          setInput((current: string) => {
             // If there's existing text, append with space
             // If empty, use the transcript directly
             return current ? `${current} ${capitalizedTranscript}` : capitalizedTranscript
@@ -143,7 +192,13 @@ export function ChatbotWidget() {
     }
 
     recognition.onend = () => {
+      console.log("[CHATBOT] Voice dictation ended")
+      clearTimeout(silenceTimeoutRef.current)
       setRecording(false)
+      // Only set isListening false if not already closing (animation handles it)
+      if (!isClosing) {
+        setIsListening(false)
+      }
       // Small delay before focusing to prevent interference
       setTimeout(() => {
         inputRef.current?.focus()
@@ -151,14 +206,29 @@ export function ChatbotWidget() {
     }
 
     recognition.onerror = (event: any) => {
-      console.error("[CHATBOT] Speech recognition error:", event)
+      clearTimeout(silenceTimeoutRef.current)
+      if (event.error !== "aborted") {
+        console.error("[CHATBOT] Speech recognition error:", event.error)
+      }
       setRecording(false)
       recognition.stop?.()
     }
 
     recognitionRef.current = recognition
     setSpeechSupported(true)
-  }, [speechLanguage])
+
+    // Cleanup function
+    return () => {
+      clearTimeout(silenceTimeoutRef.current)
+      if (recognitionRef.current) {
+        try {
+          recognitionRef.current.abort()
+        } catch (e) {
+          // Ignore cleanup errors
+        }
+      }
+    }
+  }, [speechLanguage, isClosing])
 
   const handleVoiceToggle = () => {
     if (!recognitionRef.current) {
@@ -167,8 +237,7 @@ export function ChatbotWidget() {
     }
 
     if (recording) {
-      recognitionRef.current.stop()
-      setRecording(false)
+      stopListeningWithAnimation()
       return
     }
 
@@ -178,6 +247,16 @@ export function ChatbotWidget() {
       console.error("[CHATBOT] Speech recognition start error:", error)
       setRecording(false)
     }
+  }
+
+  const handleVoiceSubmit = () => {
+    if (!input.trim() || isLoading) return
+
+    // ✅ All users can query all data - no restrictions
+    setComparisonData(null)
+    setError(null)
+    sendMessage({ text: input })
+    setInput("")
   }
 
   const scrollRef = useRef<HTMLDivElement>(null)
@@ -239,18 +318,14 @@ export function ChatbotWidget() {
     transport: new DefaultChatTransport({
       api,
     }),
-    headers: {
-      'x-user-role': userRole || 'unknown',
-      'x-session-id': sessionId || '',
-    },
-    onError: (error) => {
+    onError: (error: any) => {
       console.error("[CHATBOT] Error:", error)
       // Try to extract the error response from the error object
-      const errorData = (error as any)?.data || error
+      const errorData = error?.data || error
       const parsedError = parseErrorResponse(errorData)
       setError(parsedError)
     },
-    onFinish: (result) => {
+    onFinish: (result: any) => {
       console.log("[CHATBOT] Message finished")
       const text = ((result.message as any).parts || [])
         .filter((part: any) => part?.type === "text" || part?.type === "reasoning")
@@ -270,7 +345,7 @@ export function ChatbotWidget() {
   })
 
   // Custom submit handler with frontend RBAC check
-  const handleSubmit = (e: React.FormEvent) => {
+  const handleSubmit = (e: React.FormEvent<HTMLFormElement>) => {
     e.preventDefault()
     if (!input.trim() || isLoading) return
 
@@ -334,7 +409,7 @@ export function ChatbotWidget() {
 **Severity:** ${pendingAnomaly.severity}
 
 **Root Causes Identified:**
-${pendingAnomaly.root_causes.map((cause) => `- ${cause}`).join('\n')}
+${pendingAnomaly.root_causes.map((cause: string) => `- ${cause}`).join('\n')}
 
 Please provide a detailed analysis and solution recommendations. After analysis, confirm if you're ready to proceed with automated resolution.`
 
@@ -435,7 +510,216 @@ Please provide a detailed analysis and solution recommendations. After analysis,
           -ms-overflow-style: none;
           scrollbar-width: none;
         }
+
+        /* Cartoon Pop-In Animation */
+        @keyframes cartoonPopIn {
+          0% {
+            transform: scale(0) rotate(-10deg);
+            opacity: 0;
+          }
+          50% {
+            transform: scale(1.15) rotate(3deg);
+          }
+          100% {
+            transform: scale(1) rotate(0deg);
+            opacity: 1;
+          }
+        }
+
+        /* Pop Out Animation */
+        @keyframes cartoonPopOut {
+          0% {
+            transform: scale(1) rotate(0deg);
+            opacity: 1;
+          }
+          100% {
+            transform: scale(0) rotate(-10deg);
+            opacity: 0;
+          }
+        }
+
+        /* Bounce Effect */
+        @keyframes bounce {
+          0%, 100% {
+            transform: translateY(0);
+          }
+          50% {
+            transform: translateY(-20px);
+          }
+        }
+
+        /* Pulse Glow for Mic */
+        @keyframes micPulse {
+          0%, 100% {
+            box-shadow: 0 0 0 0 rgba(239, 68, 68, 0.7), inset 0 0 0 0 rgba(239, 68, 68, 0.3);
+          }
+          50% {
+            box-shadow: 0 0 0 25px rgba(239, 68, 68, 0), inset 0 0 30px 0 rgba(239, 68, 68, 0.5);
+          }
+        }
+
+        /* Wave Animation for listening text */
+        @keyframes wave {
+          0%, 100% {
+            opacity: 0.6;
+            transform: scale(1);
+          }
+          50% {
+            opacity: 1;
+            transform: scale(1.08);
+          }
+        }
+
+        /* Soundwave Animation */
+        @keyframes soundwave {
+          0%, 100% {
+            transform: scaleY(0.4);
+            opacity: 0.4;
+          }
+          50% {
+            transform: scaleY(1);
+            opacity: 1;
+          }
+        }
+
+        /* Fade Background */
+        @keyframes fadeIn {
+          from {
+            opacity: 0;
+          }
+          to {
+            opacity: 1;
+          }
+        }
+
+        .modal-enter {
+          animation: cartoonPopIn 0.7s cubic-bezier(0.34, 1.56, 0.64, 1) forwards;
+        }
+
+        .modal-exit {
+          animation: cartoonPopOut 0.5s cubic-bezier(0.64, 0, 0.78, 0.34) forwards;
+        }
+
+        .mic-glow {
+          animation: micPulse 2.5s ease-in-out infinite;
+        }
+
+        .listening-text {
+          animation: wave 1.5s ease-in-out infinite;
+        }
+
+        .soundwave-bar {
+          animation: soundwave 0.8s ease-in-out infinite;
+        }
+
+        .soundwave-bar:nth-child(1) {
+          animation-delay: 0s;
+        }
+        .soundwave-bar:nth-child(2) {
+          animation-delay: 0.1s;
+        }
+        .soundwave-bar:nth-child(3) {
+          animation-delay: 0.2s;
+        }
+        .soundwave-bar:nth-child(4) {
+          animation-delay: 0.3s;
+        }
+        .soundwave-bar:nth-child(5) {
+          animation-delay: 0.2s;
+        }
+        .soundwave-bar:nth-child(6) {
+          animation-delay: 0.1s;
+        }
+
+        .fade-in {
+          animation: fadeIn 0.4s ease-out;
+        }
+
+        /* Close Button Animation */
+        @keyframes rotateClose {
+          0% {
+            transform: rotate(0deg) scale(1);
+          }
+          50% {
+            transform: rotate(180deg) scale(1.1);
+          }
+          100% {
+            transform: rotate(360deg) scale(1);
+          }
+        }
+
+        .close-btn:hover {
+          animation: rotateClose 0.6s ease-in-out;
+        }
       `}</style>
+
+      {/* Listening Modal Popup with Cartoon Animation */}
+      {isListening && (
+        <div 
+          className="fixed inset-0 z-[60] flex items-center justify-center fade-in"
+          style={{ backgroundColor: 'rgba(0, 0, 0, 0.55)' }}
+          onClick={stopListeningWithAnimation}
+        >
+          <div 
+            className={`${isClosing ? 'modal-exit' : 'modal-enter'} relative bg-gradient-to-br from-red-950 via-slate-900 to-red-950 border-4 border-red-500 rounded-[40px] shadow-2xl shadow-red-500/70 p-12 flex flex-col items-center justify-center w-96 h-[430px]`}
+            onClick={(e: React.MouseEvent<HTMLDivElement>) => e.stopPropagation()}
+          >
+            
+            {/* Animated Background Glow */}
+            <div className="absolute inset-0 rounded-[40px] bg-gradient-to-br from-red-600/25 to-transparent opacity-50"></div>
+
+            {/* Close Button - Top Right */}
+            <button
+              onClick={stopListeningWithAnimation}
+              className="close-btn absolute top-5 right-5 z-20 w-12 h-12 bg-red-600 hover:bg-red-500 rounded-full flex items-center justify-center transition-all duration-200 hover:shadow-lg hover:shadow-red-500/60 cursor-pointer border-2 border-red-400 active:scale-95"
+              title="Stop listening"
+            >
+              <svg className="w-7 h-7 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={3} d="M6 18L18 6M6 6l12 12" />
+              </svg>
+            </button>
+
+            {/* Content Container */}
+            <div className="relative z-10 flex flex-col items-center justify-center w-full h-full gap-6">
+              
+              {/* Red Mic Icon with Pulse Glow */}
+              <div className="relative flex items-center justify-center mt-2">
+                <div className="mic-glow absolute w-40 h-40 bg-gradient-to-br from-red-600 to-red-700 rounded-full"></div>
+                <button
+                  onClick={stopListeningWithAnimation}
+                  className="relative w-32 h-32 bg-gradient-to-br from-red-600 to-red-800 rounded-full flex items-center justify-center shadow-2xl shadow-red-500/80 border-4 border-red-400 hover:from-red-500 hover:to-red-700 transition-all duration-200 cursor-pointer hover:scale-110 active:scale-95"
+                >
+                  <Mic className="w-16 h-16 text-white animate-bounce" style={{ animationDuration: '1.5s' }} />
+                </button>
+              </div>
+
+              {/* Listening Text */}
+              <div className="text-center space-y-2">
+                <p className="listening-text text-white font-black text-5xl tracking-wider">
+                  Listening
+                </p>
+                <p className="text-red-300 font-semibold text-lg">Speak Now</p>
+              </div>
+
+              {/* Soundwave Visualization */}
+              <div className="flex items-center justify-center gap-2.5 h-16">
+                {[1, 2, 3, 4, 5, 6].map((i) => (
+                  <div
+                    key={i}
+                    className="soundwave-bar bg-gradient-to-t from-red-500 to-red-300 rounded-full shadow-lg"
+                    style={{ width: '3px', height: `${25 + i * 12}px` }}
+                  ></div>
+                ))}
+              </div>
+
+              {/* Hint Text */}
+              <p className="text-red-200/70 text-sm font-medium leading-tight">
+                Tap to stop listening
+              </p>
+            </div>
+          </div>
+        </div>
+      )}
 
       <Card className="fixed top-20 right-0 bottom-0 w-[360px] flex flex-col shadow-2xl z-50 overflow-hidden border-l border-violet-900/30 bg-gradient-to-b from-slate-950 via-slate-900 to-slate-950 backdrop-blur-xl">
         <CardHeader className="pb-3 border-b border-violet-900/20 shrink-0 px-4 bg-gradient-to-r from-violet-900/10 to-transparent">
@@ -596,7 +880,7 @@ Please provide a detailed analysis and solution recommendations. After analysis,
                 value={speechLanguage}
                 onChange={(e) => setSpeechLanguage(e.target.value as 'en-IN' | 'en-US')}
                 className="bg-transparent border-none text-violet-300/70 text-[10px] cursor-pointer focus:outline-none focus:ring-0 hover:text-violet-200"
-                disabled={recording}
+                disabled={isListening}
               >
                 <option value="en-IN">IN</option>
                 <option value="en-US">US</option>
@@ -612,7 +896,7 @@ Please provide a detailed analysis and solution recommendations. After analysis,
                   ref={inputRef}
                   value={input}
                   onChange={(e) => setInput(e.target.value)}
-                  placeholder={recording ? "Listening..." : "Ask a question..."}
+                  placeholder={isListening ? "Listening..." : "Ask a question..."}
                   disabled={isLoading}
                   className="w-full text-sm placeholder:text-sm bg-slate-800/60 border-slate-700/50 text-white placeholder-slate-500 focus-visible:ring-violet-500 focus-visible:border-violet-500"
                 />
@@ -620,10 +904,10 @@ Please provide a detailed analysis and solution recommendations. After analysis,
               <Button
                 type="button"
                 onClick={handleVoiceToggle}
-                title={recording ? "Stop recording" : "Start voice input"}
+                title={isListening ? "Stop listening" : "Start voice input"}
                 aria-label="Voice input"
                 size="icon"
-                className={`h-10 w-10 min-w-[2.5rem] rounded-xl border border-pink-500/30 text-white ${recording ? 'bg-pink-500/95 ring ring-pink-400/60 animate-pulse' : 'bg-gradient-to-br from-pink-600 to-violet-600'} hover:from-fuchsia-500 hover:to-violet-500 shadow-lg shadow-pink-500/20 disabled:opacity-50`}
+                className={`h-10 w-10 min-w-[2.5rem] rounded-xl border border-pink-500/30 text-white ${isListening ? 'bg-pink-500/95 ring ring-pink-400/60 animate-pulse' : 'bg-gradient-to-br from-pink-600 to-violet-600'} hover:from-fuchsia-500 hover:to-violet-500 shadow-lg shadow-pink-500/20 disabled:opacity-50`}
               >
                 <Mic className="w-4 h-4" />
               </Button>
